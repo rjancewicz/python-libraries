@@ -3,8 +3,13 @@
 import io
 import re
 import sys
+import argparse
 from os import SEEK_SET, SEEK_END
 from mmap import mmap, PROT_READ
+
+import pdb
+
+DEBUG = False
 
 """
     LDIF File Structure
@@ -175,8 +180,9 @@ class LDIFFile(object):
                     else:
                         rec[key] = set([value])
             else:
+                sys.stderr.write(">>> ERROR Ignored: {0}\n".format(line))
                 pass
-#                raise ValueError(line)
+                # raise ValueError(line)
 
             if self.EOF():
                 break
@@ -193,9 +199,12 @@ class LDIFFile(object):
         for rec in self:
 
             tag = list(rec[self.pkey])[0]
+
             if tag in self.str_index:
+                offset = self.fd.tell()
                 continue
                 raise KeyError(LDIFFile.PKEY_DUP_ERROR_STR)
+
             self.str_index[tag] = offset
             self.int_index.append(offset)
 
@@ -204,11 +213,11 @@ class LDIFFile(object):
 """
 
     ldif rec diff
-
+    (('pkey', '<PKEY_VALUE>')
         {
             x: [('+', 'foo'), ('-', 'bar'), ('=', 'baz')],
             y: [('+', 'foo'), ('-', 'bar'), ('=', 'baz')]
-        }
+        })
 
 
 """
@@ -219,9 +228,10 @@ class LDIFDiff(object):
     DIFF_ADD = '+'
     DIFF_DEL = '-'
     DIFF_EQU = '='
+    DIFF_MOD = '~'
 
     def __init__(self, path_a, path_b, memory_map=True,
-                 case_sensitive=False, ignore=None):
+                 exclude=None, include=None, case_sensitive=False):
 
         self.a = LDIFFile(path_a)
         self.b = LDIFFile(path_b)
@@ -232,65 +242,84 @@ class LDIFDiff(object):
         self.pkey = self.a.pkey
         self.case_sensitive = case_sensitive
 
-        if ignore:
-            self.ignore = ignore
-        else:
-            self.ignore = list()
+        # Exclude Keys
+        if exclude is None:
+            exclude = list()
+        self.exclude = exclude
 
-    def print_diff(self, diff):
+        # Include Keys
+        if include is None:
+            include = list()
+        self.include = include
 
-        result = False
+    def print_delta(self, delta, changes_only=True):
+
+        ((op, pkey, pkey_value), diff) = delta
         temp = io.BytesIO()
 
-        for key, ops in diff.items():
+        for key, values in diff.items():
 
-            if key == self.pkey:
-                continue
+            for op, value in values:
+                if changes_only and op == LDIFDiff.DIFF_EQU:
+                    continue
 
-            if key in self.ignore:
-                continue
-
-            for (op, value) in ops:
-
-                if op != LDIFDiff.DIFF_EQU:
-
-                    temp.write("{op} {key}: {value}\n".format(op=op,
-                                                              key=key,
-                                                              value=value))
+                temp.write("{0} {1}: {2}\n".format(op, key, value))
 
         if temp.tell():
-
-            value = list(diff[self.pkey])[0][1]
-
-            sys.stdout.write("{pkey}: {value}\n".format(pkey=self.pkey,
-                                                        value=value))
-
+            sys.stdout.write("{0}: {1}\n".format(pkey, pkey_value))
             temp.seek(0, SEEK_SET)
             sys.stdout.write(temp.read())
-
             sys.stdout.write("\n")
 
-            result = True
-
         temp.close()
-        return result
 
-    def diff_rec(self, a, b):
+    def count_ops(self, delta):
+
+        op_equ = 0
+        op_add = 0
+        op_del = 0
+
+        (_, diff) = delta
+
+        for key, values in diff.items():
+            for op, value in values:
+                if op == LDIFDiff.DIFF_EQU:
+                    op_equ += 1
+                elif op == LDIFDiff.DIFF_ADD:
+                    op_add += 1
+                elif op == LDIFDiff.DIFF_DEL:
+                    op_del += 1
+
+        return (op_equ, op_add, op_del)
+
+    def diff_record(self, a, b):
 
         a_keys = set(a.keys())
         b_keys = set(b.keys())
 
-        same = True
-        diff = {key: list() for key in a_keys.union(b_keys)}
+        diff = dict()
 
+        # compare the keys shared between a and b
         for key in a_keys.intersection(b_keys):
+
+            # PKEY must exist in both and be the same
+            if key == self.pkey:
+                continue
+
+            if bool(self.exclude) and key in self.exclude:
+                continue
+
+            if bool(self.include) and key not in self.include:
+                continue
+
+            diff[key] = list()
 
             a_values = a[key]
             b_values = b[key]
 
             if not self.case_sensitive:
-                a_values = set(map(str.upper, a_values))
-                b_values = set(map(str.upper, b_values))
+                a_values = set(map(str.lower, a_values))
+                b_values = set(map(str.lower, b_values))
 
             # noop
             for value in a_values.intersection(b_values):
@@ -299,70 +328,89 @@ class LDIFDiff(object):
             # delete
             for value in a_values.difference(b_values):
                 diff[key].append((LDIFDiff.DIFF_DEL, value))
-                same = False
 
             # create
             for value in b_values.difference(a_values):
                 diff[key].append((LDIFDiff.DIFF_ADD, value))
-                same = False
 
         # delete
         for key in a_keys.difference(b_keys):
+
+            if bool(self.exclude) and key in self.exclude:
+                continue
+
+            if bool(self.include) and key not in self.include:
+                continue
+
+            diff[key] = list()
+
             for value in a[key]:
                 diff[key].append((LDIFDiff.DIFF_DEL, value))
-                same = False
 
         # create
         for key in b_keys.difference(a_keys):
+
+            if bool(self.exclude) and key in self.exclude:
+                continue
+
+            if bool(self.include) and key not in self.include:
+                continue
+
+            diff[key] = list()
+
             for value in b[key]:
                 diff[key].append((LDIFDiff.DIFF_ADD, value))
-                same = False
 
-        return (same, diff)
+        return diff
 
     def diff(self):
 
-        pkey = self.a.pkey
-
+        global DEBUG
+        # collect all of the pkey values in both LDIFFiles
         a_keys = set(self.a.str_index.keys())
         b_keys = set(self.b.str_index.keys())
 
-        count = 0
-        # modify
+        # intersection gives us keys in both sets (modify)
         for index in a_keys.intersection(b_keys):
             a_rec = self.a[index]
             b_rec = self.b[index]
-            (same, diff) = self.diff_rec(a_rec, b_rec)
+            diff = self.diff_record(a_rec, b_rec)
+            yield ((LDIFDiff.DIFF_MOD, self.pkey, index), diff)
 
-            if self.print_diff(diff):
-                count += 1
-
-        sys.stderr.write("MODIFY {0}\n".format(count))
-
-        count = 0
-        # create
+        # difference b-a = keys in 'b' but not in 'a' (create)
         for index in b_keys.difference(a_keys):
             b_rec = self.b[index]
-            (same, diff) = self.diff_rec({}, b_rec)
+            diff = self.diff_record({}, b_rec)
+            yield ((LDIFDiff.DIFF_ADD, self.pkey, index), diff)
 
-            count += 1
-            self.print_diff(diff)
-
-        sys.stderr.write("CREATE {0}\n".format(count))
-
-        count = 0
-        # delete
+        # difference a-b = keys in 'a' but not in 'b' (delete)
         for index in a_keys.difference(b_keys):
             a_rec = self.a[index]
-            (same, diff) = self.diff_rec(a_rec, {})
+            diff = self.diff_record(a_rec, {})
+            yield ((LDIFDiff.DIFF_DEL, self.pkey, index), diff)
 
-            count += 1
-            self.print_diff(diff)
 
-        sys.stderr.write("DELETE {0}\n".format(count))
+_DESCRIPTION = """LDIFDiff
+    Compute the changes from one LDIF style file to another.
+"""
 
 
 def main():
+
+    parser = argparse.ArgumentParser(prog="ldifdiff.py",
+                                     description=_DESCRIPTION)
+    parser.add_argument('x', metavar='original',
+                        help="original file")
+    parser.add_argument('y', metavar='file_b',
+                        help="updated file")
+
+    parser.add_argument("--verbose", "-v", action="store_true", dest="verbose")
+    parser.add_argument("--exclude", "-e", nargs="+")
+    parser.add_argument("--include", "-i", nargs="+")
+
+    args = parser.parse_args()
+    print args
+
     ldd = LDIFDiff()
 
 
